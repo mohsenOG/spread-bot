@@ -1,12 +1,12 @@
 import time
 from contextlib import nullcontext
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 
 import requests
 
 import config
-from grid_bot import BUY, INITIAL, MAKER_RATE, SELL, STATE_FILE, GridBot, lock_state
+from grid_bot import BUY, INITIAL, SELL, STATE_FILE, GridBot, lock_state
 from kucoin_rest import KuCoinError, KuCoinREST
 
 
@@ -14,7 +14,7 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def market_report(api: KuCoinREST, bot: GridBot):
+def market_report(api: KuCoinREST, bot: GridBot, *, connected: bool = True):
     print("\n========== HOURLY MARKET REPORT ==========")
     print(f"Time:                {utc_now()}")
     print(f"Symbol:              {config.SYMBOL}")
@@ -50,7 +50,7 @@ def market_report(api: KuCoinREST, bot: GridBot):
                       ("USDC", "available", "Available USDC"),
                       ("USDT", "balance", "Current USDT"))
     amounts = ["Unavailable" if api.live else "Unavailable in preview"] * len(balance_fields)
-    if api.live:
+    if api.live and connected:
         try:
             accounts = api.spot_accounts()
             amounts = [f"{Decimal(accounts.get(currency, {}).get(field, '0')):,.4f}"
@@ -59,6 +59,17 @@ def market_report(api: KuCoinREST, bot: GridBot):
             print(f"Balance check error: {exc}")
     for (_, _, label), amount in zip(balance_fields, amounts):
         print(f"{label + ':':<21}{amount}")
+    if api.live:
+        fee = "Unavailable"
+        if connected:
+            try:
+                rate = Decimal(api.fee_rates(config.SYMBOL)["makerFeeRate"])
+                if not rate.is_finite():
+                    raise ValueError("Invalid maker fee rate.")
+                fee = f"{rate:%}"
+            except (KuCoinError, KeyError, TypeError, ValueError, ArithmeticError, requests.RequestException) as exc:
+                fee = f"Unavailable ({exc})"
+        print(f"Maker fee:           {fee}")
     print(f"Completed cycles:    {bot.state['cycles']}")
     print(f"Realized profit:     {Decimal(bot.state['realized']):+,.4f} USDT")
     for currency, fee in sorted(bot.state["realized_other_fees"].items()):
@@ -69,28 +80,41 @@ def market_report(api: KuCoinREST, bot: GridBot):
 def run(api: KuCoinREST, bot: GridBot):
     if not api.live:
         bot.status = (f"Preview. Would place a post-only SELL for up to {INITIAL:,.2f} USDT "
-                      f"@ {SELL:.4f} USDC. Configured maker fee {MAKER_RATE:.2%}.")
+                      f"@ {SELL:.4f} USDC.")
 
     next_report = next_poll = time.monotonic()
+    backoff = 0
     while True:
         now = time.monotonic()
         if now >= next_poll:
             try:
                 bot.poll()
-            except (KuCoinError, KeyError, TypeError, ArithmeticError) as exc:
-                bot.set_status(f"{utc_now()} Trading check failed. Will retry: {exc}")
-            next_poll = time.monotonic() + config.POLL_INTERVAL_SECONDS
+            except KuCoinError as exc:
+                if not exc.retryable:
+                    raise
+                bot.account_verified = False
+                if not backoff:
+                    print(f"{utc_now()} KuCoin connectivity interrupted. {exc} Retrying.", flush=True)
+                backoff = min(30, backoff * 2 or 2)
+                delay = max(backoff, exc.retry_after)
+            else:
+                if backoff:
+                    print(f"{utc_now()} KuCoin connectivity restored.", flush=True)
+                backoff = 0
+                delay = config.POLL_INTERVAL_SECONDS
+            next_poll = time.monotonic() + delay
         now = time.monotonic()
         if now >= next_report:
             next_report = now + config.MARKET_REPORT_INTERVAL_SECONDS
-            market_report(api, bot)
+            market_report(api, bot, connected=not backoff)
         time.sleep(max(0, min(next_poll, next_report) - time.monotonic()))
 
 
 def main() -> int:
     try:
-        if min(config.POLL_INTERVAL_SECONDS, config.MARKET_REPORT_INTERVAL_SECONDS) <= 0:
-            raise ValueError("Poll and report intervals must be positive.")
+        if min(config.POLL_INTERVAL_SECONDS, config.MARKET_REPORT_INTERVAL_SECONDS,
+               config.PARTIAL_FILL_TIMEOUT_SECONDS) <= 0:
+            raise ValueError("Poll, report, and partial-fill timeout intervals must be positive.")
         if config.MARKET_REPORT_KLINE_INTERVAL != "1min":
             raise ValueError("The hourly report requires 1min candles.")
         with requests.Session() as session:
@@ -100,7 +124,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nStopped.")
         return 0
-    except (ValueError, RuntimeError, KeyError, TypeError, OSError) as exc:
+    except (ValueError, RuntimeError, KeyError, TypeError, OSError, DecimalException, requests.RequestException) as exc:
         print(f"{utc_now()} Bot stopped: {exc}", flush=True)
         return 1
 
