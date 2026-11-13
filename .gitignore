@@ -221,3 +221,9 @@ __marimo__/
 
 # Local grid bot state
 /.grid_bot.*
+
+# Backtest downloads and reports
+/backtest/history/*
+!/backtest/history/.gitkeep
+/backtest/results/*
+!/backtest/results/.gitkeep
