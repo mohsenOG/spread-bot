@@ -40,8 +40,12 @@ def cached_history(directory: Path, start: pd.Timestamp, end: pd.Timestamp) -> P
 def download_history(api: KuCoinREST, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     start_second, end_second = int(start.timestamp()), int(end.timestamp())
     page_seconds = KLINE_PAGE_SIZE * 60
+    page_starts = range(start_second, end_second, page_seconds)
+    total_batches = len(page_starts)
+    width = len(str(total_batches))
     rows = []
-    for page_start in range(start_second, end_second, page_seconds):
+    for batch, page_start in enumerate(page_starts, start=1):
+        print(f"Batch {batch:0{width}d}/{total_batches}", flush=True)
         page_end = min(end_second, page_start + page_seconds)
         for attempt in range(3):
             try:
