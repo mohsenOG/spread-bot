@@ -223,7 +223,5 @@ __marimo__/
 /.grid_bot.*
 
 # Backtest downloads and reports
-/backtest/history/*
-!/backtest/history/.gitkeep
-/backtest/results/*
-!/backtest/results/.gitkeep
+/backtest/history/
+/backtest/results*/
