@@ -1,172 +1,129 @@
+import csv
 from decimal import Decimal
 from html import escape
 from pathlib import Path
 from string import Template
 
-import pandas as pd
+from config_test import BACKTEST_DIR, RESULTS_DIR, SYMBOL
 
-from backtest import MINUTE, BacktestResult
-from config_test import BACKTEST_DIR, RESULTS_DIR
+RESULT_COLUMNS = (
+    "buy_price", "sell_price", "completed_cycles", "ending_equity_usdt",
+    "net_profit_usdt", "net_profit_pct",
+)
 
 
-def format_holding(seconds: float | None) -> str:
-    if seconds is None:
-        return "N/A"
-    minutes, seconds = divmod(round(seconds), 60)
-    days, minutes = divmod(minutes, 1440)
-    hours, minutes = divmod(minutes, 60)
-    duration = f"{hours}h {minutes}m" + (f" {seconds}s" if seconds else "")
-    return f"{days}d {duration}" if days else duration
+def format_price(value: Decimal) -> str:
+    whole, _, fraction = format(value, "f").partition(".")
+    return f"{whole}.{fraction.rstrip('0').ljust(4, '0')}"
 
 
 def format_percent(value: Decimal) -> str:
-    return f"{value:+.2E}%" if abs(value) >= 1_000_000 else f"{value:+,.2f}%"
+    return f"{value:+,.2f}%"
 
 
-def money(value: Decimal, *, signed: bool = False) -> str:
-    return f"{value:+,.2f}" if signed else f"{value:,.2f}"
+def net_profit(row: dict) -> str:
+    return f"{row['net_profit_usdt']:+,.2f} USDT ({format_percent(row['net_profit_pct'])})"
 
 
-def color(value: Decimal) -> str:
-    return "gain" if value > 0 else "loss" if value < 0 else ""
+def metric(label: str, value: str) -> str:
+    return f'<div class="metric"><dt>{label}</dt><dd>{escape(value)}</dd></div>'
 
 
-def metric(label: str, value: str, tone: str = "") -> str:
-    return (f'<div class="metric"><dt>{escape(label)}</dt>'
-            f'<dd class="{tone}">{escape(value)}</dd></div>')
-
-
-def table_row(cells: tuple) -> str:
-    return "<tr>" + "".join(
-        f'<td data-sort="{escape(str(key), quote=True)}" class="{tone}">{escape(str(value))}</td>'
-        for value, key, tone in cells
-    ) + "</tr>"
-
-
-def cycle_rows(cycles: pd.DataFrame) -> str:
+def heatmap(results: list[dict], buys: list[Decimal], sells: list[Decimal]) -> str:
+    by_pair = {(row["buy_price"], row["sell_price"]): row for row in results}
+    best = results[0]
+    highest = max(0, best["net_profit_pct"])
+    lowest = min(0, results[-1]["net_profit_pct"])
+    columns = "".join(f'<th scope="col">{format_price(sell)}</th>' for sell in sells)
     rows = []
-    for row in cycles.itertuples(index=False):
-        rows.append(table_row((
-            (row.cycle, row.cycle, ""),
-            (f"{row.sell_time_utc:%Y-%m-%d %H:%M}", row.sell_time_utc.timestamp(), ""),
-            (f"{row.sell_price:.4f}", row.sell_price, ""),
-            (f"{row.buy_time_utc:%Y-%m-%d %H:%M}", row.buy_time_utc.timestamp(), ""),
-            (f"{row.buy_price:.4f}", row.buy_price, ""),
-            (f"{row.sell_fee_usdc + row.buy_fee_usdc:,.4f}", row.sell_fee_usdc + row.buy_fee_usdc, ""),
-            (money(row.profit_usdt, signed=True), row.profit_usdt, color(row.profit_usdt)),
-            (format_percent(row.return_pct), row.return_pct, color(row.return_pct)),
-            (format_holding(row.holding_seconds), row.holding_seconds, ""),
-        )))
-    return "".join(rows) or '<tr><td colspan="9" class="empty">No completed cycles.</td></tr>'
+    for buy in buys:
+        cells = [f'<th scope="row">{format_price(buy)}</th>']
+        for sell in sells:
+            row = by_pair.get((buy, sell))
+            if row is None:
+                cells.append('<td class="unavailable" aria-label="Unavailable"></td>')
+                continue
+            percent = row["net_profit_pct"]
+            if percent > 0:
+                hue, strength = 151, percent / highest
+            elif percent < 0:
+                hue, strength = 8, percent / lowest
+            else:
+                hue, strength = 210, 0
+            lightness = 97 - 28 * strength
+            tooltip = (f"BUY {format_price(buy)}\nSELL {format_price(sell)}\n"
+                       f"Net profit {net_profit(row)}\nCompleted cycles {row['completed_cycles']:,}")
+            title = escape(tooltip).replace("\n", "&#10;")
+            highlight = ' class="best"' if row is best else ""
+            cells.append(f'<td{highlight} style="background:hsl({hue} 65% {lightness:.2f}%)" title="{title}">'
+                         f'{format_percent(percent)}</td>')
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+
+    return f"""<section class="panel">
+      <h2 id="heatmap-heading">Profitability heatmap</h2>
+      <div class="scroll" role="region" aria-labelledby="heatmap-heading" tabindex="0">
+        <table class="heatmap" aria-labelledby="heatmap-heading">
+          <thead>
+            <tr><td></td><th colspan="{len(sells)}" scope="colgroup">SELL price</th></tr>
+            <tr><th scope="col">BUY price</th>{columns}</tr>
+          </thead>
+          <tbody>{''.join(rows)}</tbody>
+        </table>
+      </div>
+    </section>"""
 
 
-def month_rows(months: list[dict]) -> str:
-    rows = []
-    for row in months:
-        profit, percent = row["profit_usdt"], row["return_pct"]
-        rows.append(table_row((
-            (row["month"], row["month"], ""),
-            (row["completed_cycles"], row["completed_cycles"], ""),
-            (money(row["opening_equity_usdt"]), row["opening_equity_usdt"], ""),
-            (money(row["closing_equity_usdt"]), row["closing_equity_usdt"], ""),
-            (money(profit, signed=True), profit, color(profit)),
-            (format_percent(percent), percent, color(percent)),
-        )))
-    return "".join(rows)
+def top_combinations(results: list[dict]) -> str:
+    rows = "".join(
+        f"<tr><td>{format_price(row['buy_price'])}</td><td>{format_price(row['sell_price'])}</td>"
+        f"<td>{format_percent(row['net_profit_pct'])}</td><td>{row['net_profit_usdt']:+,.2f}</td>"
+        f"<td>{row['completed_cycles']:,}</td></tr>"
+        for row in results[:5]
+    )
+    return f"""<section class="panel">
+      <h2 id="top-heading">Top 5 combinations</h2>
+      <div class="scroll" role="region" aria-labelledby="top-heading" tabindex="0">
+        <table aria-labelledby="top-heading">
+          <thead><tr><th scope="col">BUY</th><th scope="col">SELL</th><th scope="col">Net profit %</th>
+            <th scope="col">Net profit USDT</th><th scope="col">Completed cycles</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </section>"""
 
 
-def equity_chart(result: BacktestResult) -> str:
-    start, end = (result.summary[key] for key in ("start_utc", "end_utc"))
-    points = [(start, result.summary["initial_usdt"])]
-    points.extend((time + MINUTE, value) for time, value in result.equity[
-        ["candle_time_utc", "equity_usdt"]
-    ].itertuples(index=False, name=None))
-    left, right, top, bottom = 84, 954, 20, 240
-    low, high = min(value for _, value in points), max(value for _, value in points)
-    padding = (high - low) / 12 or high / 100
-    low, high = low - padding, high + padding
-    duration = (end - start).total_seconds()
-
-    # Keep both extremes in each bucket so long histories still show brief moves.
-    step = (len(points) + 699) // 700
-    sampled = [points[0]]
-    for index in range(0, len(points), step):
-        bucket = points[index:index + step]
-        extremes = (min(bucket, key=lambda point: point[1]), max(bucket, key=lambda point: point[1]))
-        sampled.extend(sorted(set(extremes)))
-    sampled.append(points[-1])
-    coordinates = []
-    for time, value in sampled:
-        x = left + (right - left) * (time - start).total_seconds() / duration
-        y = bottom - (bottom - top) * float((value - low) / (high - low))
-        coordinates.append(f"{x:.2f},{y:.2f}")
-
-    parts = ['<svg viewBox="0 0 980 285" role="img" aria-label="USDT equity over time">']
-    for tick in range(5):
-        y = bottom - (bottom - top) * tick / 4
-        value = low + (high - low) * tick / 4
-        parts.append(f'<line x1="{left}" x2="{right}" y1="{y}" y2="{y}"/>'
-                     f'<text x="{left - 9}" y="{y + 4}" text-anchor="end">{value:,.2f}</text>')
-    date_format = "%Y-%m-%d %H:%M" if duration < 3 * 86400 else "%Y-%m-%d"
-    intervals = min(4, int(duration // 60))
-    for tick in range(intervals + 1):
-        x = left + (right - left) * tick / intervals
-        date = start + (end - start) * tick / intervals
-        anchor = "start" if tick == 0 else "end" if tick == intervals else "middle"
-        parts.append(f'<text x="{x}" y="265" text-anchor="{anchor}">{date:{date_format}}</text>')
-    line = " ".join(coordinates)
-    parts.append(f'<polygon points="{left},{bottom} {line} {right},{bottom}"/>'
-                 f'<polyline points="{line}"/></svg>')
-    return "".join(parts)
-
-
-def save_results(result: BacktestResult, directory: Path = RESULTS_DIR) -> Path:
-    summary = result.summary
+def save_results(results: list[dict], buys: list[Decimal], sells: list[Decimal],
+                 directory: Path = RESULTS_DIR) -> tuple[Path, Path]:
+    best = results[0]
+    start, end = best["start_utc"], best["end_utc"]
+    prefix = f"{SYMBOL}_{start:%Y%m%dT%H%MZ}_{end:%Y%m%dT%H%MZ}"
     directory.mkdir(parents=True, exist_ok=True)
-    start, end = summary["start_utc"], summary["end_utc"]
-    prefix = f"{summary['symbol']}_{start:%Y%m%dT%H%MZ}_{end:%Y%m%dT%H%MZ}"
-    result.cycles.to_csv(directory / f"{prefix}_cycles.csv", index=False)
-    result.equity.to_csv(directory / f"{prefix}_equity.csv", index=False)
-    pd.DataFrame([summary]).to_csv(directory / f"{prefix}_summary.csv", index=False)
+    csv_path = directory / f"{prefix}_combinations.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=RESULT_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(results)
 
-    net, realized, unrealized = (summary[key] for key in
-                                 ("net_profit_usdt", "realized_profit_usdt", "unrealized_profit_usdt"))
-    total, annualized = (summary[key] for key in ("total_return_pct", "annualized_return_pct"))
-    opened = summary["open_sell_time_utc"]
+    multiple = len(results) > 1
+    label = "Best " if multiple else ""
     metrics = [
-        metric("Starting capital", money(summary["initial_usdt"]) + " USDT"),
-        metric("Ending equity", money(summary["ending_equity_usdt"]) + " USDT"),
-        metric("Net profit", money(net, signed=True) + " USDT", color(net)),
-        metric("Total return", format_percent(total), color(total)),
-        metric("Annualized return", format_percent(annualized), color(annualized)),
-        metric("Realized profit", money(realized, signed=True) + " USDT", color(realized)),
-        metric("Unrealized P/L", money(unrealized, signed=True) + " USDT", color(unrealized)),
-        metric("Completed cycles", f"{summary['completed_cycles']:,}"),
-        metric("Average holding", format_holding(summary["average_holding_seconds"])),
-        metric("Maximum holding", format_holding(summary["max_holding_seconds"])),
-        metric("Open position", "USDC / waiting to buy" if opened is not None else "None"),
+        metric(label + "BUY price", format_price(best["buy_price"])),
+        metric(label + "SELL price", format_price(best["sell_price"])),
     ]
-    if opened is None:
-        position = '<p class="empty">No open position. The strategy ended in WAIT_SELL.</p>'
-    else:
-        position = '<dl class="metrics">' + "".join((
-            metric("SELL time (UTC)", f"{opened:%Y-%m-%d %H:%M}"),
-            metric("Available USDC", f"{summary['ending_usdc']:,.4f}"),
-            metric("SELL fee", f"{summary['open_sell_fee_usdc']:,.4f} USDC"),
-            metric("Final USDT close", f"{summary['final_close_usdc_per_usdt']:.4f} USDC"),
-            metric("Mark-to-market value", money(summary["open_position_value_usdt"]) + " USDT"),
-            metric("Unrealized P/L", money(unrealized, signed=True) + " USDT", color(unrealized)),
-            metric("Time waiting for BUY", format_holding(summary["open_holding_seconds"])),
-        )) + "</dl>"
+    if not multiple:
+        metrics.extend([
+            metric("Initial balance", f"{best['initial_usdt']:,.2f} USDT"),
+            metric("Final equity", f"{best['ending_equity_usdt']:,.2f} USDT"),
+        ])
+    metrics.extend([
+        metric("Best net profit" if multiple else "Net profit", net_profit(best)),
+        metric("Completed cycles", f"{best['completed_cycles']:,}"),
+    ])
 
     template = Template((BACKTEST_DIR / "report_template.html").read_text(encoding="utf-8"))
-    path = directory / f"{prefix}_report.html"
-    path.write_text(template.substitute(
-        symbol=escape(summary["symbol"]), start=f"{start:%Y-%m-%d %H:%M}", end=f"{end:%Y-%m-%d %H:%M}",
-        buy=f"{summary['buy_price']:.4f}", sell=f"{summary['sell_price']:.4f}",
-        fee=f"{summary['maker_fee_pct']:.2f}%", candles=f"{summary['candles']:,}",
-        gaps=f"{summary['missing_minutes']:,}", metrics="".join(metrics),
-        chart=equity_chart(result), cycles=cycle_rows(result.cycles),
-        months=month_rows(result.months), position=position,
+    report_path = directory / f"{prefix}_report.html"
+    report_path.write_text(template.substitute(
+        symbol=escape(SYMBOL), metrics="".join(metrics),
+        details=heatmap(results, buys, sells) + top_combinations(results) if multiple else "",
     ), encoding="utf-8")
-    return path
+    return report_path, csv_path

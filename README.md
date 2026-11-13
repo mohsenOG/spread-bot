@@ -25,6 +25,8 @@ python backtest/check_backtest.py
 
 Choose a UTC date range to download one-minute KuCoin candles, or select an existing CSV. The end date is inclusive. For the current UTC date, the download stops at the last completed minute. Downloads reuse a saved range when it covers the selection. The public API needs no credentials.
 
-History CSVs are saved in `backtest/history/`. Open the HTML file printed by the program directly in a browser. It and the cycle, equity, and summary CSVs are saved in `backtest/results/`. Reports cover the first available candle through the last candle's close. Missing minutes stay missing. The checks use synthetic candles and temporary files.
+History CSVs are saved in `backtest/history/`. The program saves a ranked combinations CSV and an offline HTML report in `backtest/results/`. Open the HTML file printed by the program in a browser. One valid pair shows a summary. Multiple valid pairs show the winner, a profitability heatmap, and the top five pairs.
 
-The backtest reads the allocation and fixed prices from `src/config.py` and `MAKER_FEE_PCT` from `backtest/config_test.py`. It assumes full hypothetical price-touch fills, uses fractional quantities, and deducts fees in USDC on both sides. Historical candles cannot establish execution, queue priority, or post-only acceptance. An open USDC balance is valued at the final close. Monthly returns use marked equity. Annualized return compounds the overall return over a 365-day year.
+Set the `BUY_PRICE_*` and `SELL_PRICE_*` ranges in `backtest/config_test.py`. Both endpoints are included, even when a step does not land on the maximum. Set equal minimum and maximum prices on each side to test one pair. The backtest skips pairs where BUY is greater than or equal to SELL. It ranks by final USDT equity, then by ascending BUY and SELL price for ties.
+
+Each pair starts with `INITIAL_USDT` from `src/config.py` and uses the same one-minute candles. The backtest assumes full price-touch fills with fractional quantities and deducts `MAKER_FEE_PCT` in USDC on each side. It values any remaining USDC at the final candle close.
